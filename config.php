@@ -684,9 +684,29 @@ function getAccreditedBoardingHouses(): array
     ));
 }
 
-function getDashboardStats(): array
+function fetchOne(mysqli $conn, string $sql, string $types, ...$params): array
 {
-    global $conn;
+    $stmt = $conn->prepare($sql);
+    if (!$stmt) {
+        return [];
+    }
+    
+    if (!empty($params)) {
+        $stmt->bind_param($types, ...$params);
+    }
+    
+    $stmt->execute();
+    $result = $stmt->get_result()->fetch_assoc() ?: [];
+    $stmt->close();
+    
+    return $result;
+}
+
+function getDashboardStats(?mysqli $conn = null): array
+{
+    if (!$conn) {
+        global $conn;
+    }
 
     $landlordId = (int) ($_SESSION['landlord_id'] ?? 0);
     $stats = [
@@ -700,56 +720,44 @@ function getDashboardStats(): array
         'active_tenants' => 0,
     ];
 
-    if ($landlordId < 1) {
+    if ($landlordId < 1 || !$conn) {
         return $stats;
     }
 
-    $stmt = $conn->prepare(
-        "SELECT COUNT(DISTINCT bh.id) AS houses,
-                COUNT(r.id) AS rooms,
-                COALESCE(SUM(r.status = 'Vacant'), 0) AS vacant,
-                COALESCE(SUM(r.status = 'Occupied'), 0) AS occupied
-         FROM boarding_houses bh
-         LEFT JOIN rooms r ON r.boarding_house_id = bh.id
-         WHERE bh.landlord_id = ? AND bh.status = 'Accredited'"
-    );
-    $stmt->bind_param('i', $landlordId);
-    $stmt->execute();
-    $row = $stmt->get_result()->fetch_assoc();
-    $stmt->close();
+    // Query 1: Boarding Houses & Rooms
+    $houseSql = "SELECT COUNT(DISTINCT bh.id) AS houses,
+                        COUNT(r.id) AS rooms,
+                        COALESCE(SUM(r.status = 'Vacant'), 0) AS vacant,
+                        COALESCE(SUM(r.status = 'Occupied'), 0) AS occupied
+                 FROM boarding_houses bh
+                 LEFT JOIN rooms r ON r.boarding_house_id = bh.id
+                 WHERE bh.landlord_id = ? AND bh.status = 'Accredited'";
+    $houseRow = fetchOne($conn, $houseSql, 'i', $landlordId);
 
-    $stmt = $conn->prepare(
-        "SELECT COUNT(*) AS active_tenants,
-                COALESCE(SUM(monthly_rent), 0) AS monthly_income
-         FROM tenants
-         WHERE landlord_id = ? AND status = 'Active'"
-    );
-    $stmt->bind_param('i', $landlordId);
-    $stmt->execute();
-    $tenantRow = $stmt->get_result()->fetch_assoc();
-    $stmt->close();
+    // Query 2: Active Tenants & Income
+    $tenantSql = "SELECT COUNT(*) AS active_tenants,
+                         COALESCE(SUM(monthly_rent), 0) AS monthly_income
+                  FROM tenants
+                  WHERE landlord_id = ? AND status = 'Active'";
+    $tenantRow = fetchOne($conn, $tenantSql, 'i', $landlordId);
 
-    $stmt = $conn->prepare(
-        "SELECT COUNT(*) AS pending_documents
-         FROM accreditation_documents d
-         INNER JOIN boarding_houses bh ON bh.id = d.boarding_house_id
-         WHERE bh.landlord_id = ? AND d.status = 'Pending'"
-    );
-    $stmt->bind_param('i', $landlordId);
-    $stmt->execute();
-    $documentRow = $stmt->get_result()->fetch_assoc();
-    $stmt->close();
+    // Query 3: Pending Documents
+    $docSql = "SELECT COUNT(*) AS pending_documents
+               FROM accreditation_documents d
+               INNER JOIN boarding_houses bh ON bh.id = d.boarding_house_id
+               WHERE bh.landlord_id = ? AND d.status = 'Pending'";
+    $docRow = fetchOne($conn, $docSql, 'i', $landlordId);
 
-    $stats['houses'] = (int) ($row['houses'] ?? 0);
-    $stats['rooms'] = (int) ($row['rooms'] ?? 0);
-    $stats['vacant'] = (int) ($row['vacant'] ?? 0);
-    $stats['occupied'] = (int) ($row['occupied'] ?? 0);
+    $stats['houses'] = (int) ($houseRow['houses'] ?? 0);
+    $stats['rooms'] = (int) ($houseRow['rooms'] ?? 0);
+    $stats['vacant'] = (int) ($houseRow['vacant'] ?? 0);
+    $stats['occupied'] = (int) ($houseRow['occupied'] ?? 0);
     $stats['active_tenants'] = (int) ($tenantRow['active_tenants'] ?? 0);
     $stats['monthly_income'] = (float) ($tenantRow['monthly_income'] ?? 0);
     $stats['occupancy_rate'] = $stats['rooms'] > 0
         ? (int) round(($stats['occupied'] / $stats['rooms']) * 100)
         : 0;
-    $stats['pending_documents'] = (int) ($documentRow['pending_documents'] ?? 0);
+    $stats['pending_documents'] = (int) ($docRow['pending_documents'] ?? 0);
 
     return $stats;
 }
@@ -758,117 +766,61 @@ function getAdminStats(): array
 {
     global $conn;
 
-    $pending = 0;
-    $approved = (int) ($conn->query("SELECT COUNT(*) AS total FROM boarding_houses WHERE status = 'Accredited' AND DATE(reviewed_at) = CURDATE()")->fetch_assoc()['total'] ?? 0);
-    $rejected = (int) ($conn->query("SELECT COUNT(*) AS total FROM boarding_houses WHERE status = 'Rejected' AND DATE(reviewed_at) = CURDATE()")->fetch_assoc()['total'] ?? 0);
-    $expiring = (int) ($conn->query("SELECT COUNT(*) AS total FROM boarding_houses WHERE status = 'Accredited' AND accreditation_expiry BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 30 DAY)")->fetch_assoc()['total'] ?? 0);
-
-    return [
-        ['label' => 'Pending Reviews', 'value' => (string) $pending, 'icon' => 'fa-file-lines', 'tone' => 'orange', 'note' => 'View all'],
-        ['label' => 'Approved Today', 'value' => (string) $approved, 'icon' => 'fa-check', 'tone' => 'green', 'note' => 'Today'],
-        ['label' => 'Rejected Today', 'value' => (string) $rejected, 'icon' => 'fa-circle-xmark', 'tone' => 'red', 'note' => 'Today'],
-        ['label' => 'Expiring Soon', 'value' => (string) $expiring, 'icon' => 'fa-fire', 'tone' => 'amber', 'note' => 'Next 30 days'],
+    $stats = [
+        'total_landlords' => 0,
+        'pending_landlords' => 0,
+        'accredited_houses' => 0,
+        'pending_documents' => 0,
+        'active_banlist' => 0,
     ];
+
+    if (!$conn) {
+        return $stats;
+    }
+
+    $resLandlords = $conn->query("SELECT COUNT(*) AS total, COALESCE(SUM(account_status = 'Pending'), 0) AS pending FROM users WHERE role = 'landlord'");
+    if ($row = $resLandlords->fetch_assoc()) {
+        $stats['total_landlords'] = (int) $row['total'];
+        $stats['pending_landlords'] = (int) $row['pending'];
+    }
+
+    $resHouses = $conn->query("SELECT COUNT(*) AS total FROM boarding_houses WHERE status = 'Accredited'");
+    if ($row = $resHouses->fetch_assoc()) {
+        $stats['accredited_houses'] = (int) $row['total'];
+    }
+
+    $resDocs = $conn->query("SELECT COUNT(*) AS total FROM accreditation_documents WHERE status = 'Pending'");
+    if ($row = $resDocs->fetch_assoc()) {
+        $stats['pending_documents'] = (int) $row['total'];
+    }
+
+    $resBanlist = $conn->query("SELECT COUNT(*) AS total FROM banlist WHERE status = 'Published'");
+    if ($row = $resBanlist->fetch_assoc()) {
+        $stats['active_banlist'] = (int) $row['total'];
+    }
+
+    return $stats;
 }
 
-function getAdminApplications(): array
+function getAdminRecentActivities(): array
 {
     global $conn;
 
-    $result = $conn->query(
-        "SELECT bh.id, bh.landlord_id, bh.name AS house, bh.address, bh.contact_number,
-                bh.description, bh.application_type, bh.created_at,
-                u.full_name AS landlord, u.email, u.phone,
-                COUNT(DISTINCT r.id) AS rooms,
-                COALESCE(ROUND(AVG(CASE
-                    WHEN r.fire_alarm = 'Yes' AND r.emergency_exit = 'Yes' THEN 100
-                    WHEN r.fire_alarm = 'Yes' OR r.emergency_exit = 'Yes' THEN 50
-                    ELSE 0 END)), 0) AS score,
-                GROUP_CONCAT(DISTINCT d.document_name ORDER BY d.document_name SEPARATOR '||') AS documents
-         FROM boarding_houses bh
-         INNER JOIN users u ON u.id = bh.landlord_id
-         LEFT JOIN rooms r ON r.boarding_house_id = bh.id
-         LEFT JOIN accreditation_documents d ON d.boarding_house_id = bh.id
-         WHERE bh.status = 'Pending'
-           AND u.account_status = 'Approved'
-         GROUP BY bh.id
-         ORDER BY bh.created_at ASC"
-    );
-
-    $rows = $result ? $result->fetch_all(MYSQLI_ASSOC) : [];
-    return array_map(static function (array $row): array {
-        $rooms = (int) $row['rooms'];
-        return [
-            'id' => (int) $row['id'],
-            'landlord_id' => (int) $row['landlord_id'],
-            'house' => $row['house'],
-            'landlord' => $row['landlord'],
-            'email' => $row['email'],
-            'phone' => $row['phone'] ?: '—',
-            'type' => $row['application_type'],
-            'address' => $row['address'],
-            'contact' => $row['contact_number'] ?: '—',
-            'rooms' => $rooms,
-            'capacity' => $rooms * 2,
-            'submitted' => date('M d, Y', strtotime($row['created_at'])),
-            'score' => (int) $row['score'],
-            'note' => $row['description'] ?: 'Landlord registration or boarding-house accreditation request.',
-            'docs' => $row['documents'] ? explode('||', $row['documents']) : [],
-        ];
-    }, $rows);
-}
-
-function getAdminReviewHistory(): array
-{
-    global $conn;
+    if (!$conn) {
+        return [];
+    }
 
     $result = $conn->query(
-        "SELECT bh.id, bh.name AS house, bh.address, bh.contact_number, bh.application_type,
-                bh.status, bh.reviewed_at, bh.review_notes, bh.date_approved,
-                u.full_name AS landlord, u.email, u.phone,
-                COUNT(r.id) AS rooms
-         FROM boarding_houses bh
-         INNER JOIN users u ON u.id = bh.landlord_id
-         LEFT JOIN rooms r ON r.boarding_house_id = bh.id
-         WHERE bh.status IN ('Pending', 'Accredited', 'Rejected')
-         GROUP BY bh.id
-         ORDER BY bh.reviewed_at DESC, bh.created_at DESC"
+        "SELECT 'document' AS type, d.document_name AS title, d.status, d.created_at, bh.name AS house
+         FROM accreditation_documents d
+         INNER JOIN boarding_houses bh ON bh.id = d.boarding_house_id
+         UNION ALL
+         SELECT 'registration' AS type, u.full_name AS title, u.account_status AS status, u.created_at, '' AS house
+         FROM users u
+         WHERE u.role = 'landlord'
+         ORDER BY created_at DESC
+         LIMIT 10"
     );
 
-    $rows = $result ? $result->fetch_all(MYSQLI_ASSOC) : [];
-    return array_map(static function (array $row): array {
-        $approved = $row['status'] === 'Accredited';
-        $decision = match ($row['status']) {
-            'Accredited' => 'Approved',
-            'Rejected' => 'Rejected',
-            default => 'Pending',
-        };
-        return [
-            'id' => (int) $row['id'],
-            'house' => $row['house'],
-            'landlord' => $row['landlord'],
-            'email' => $row['email'],
-            'phone' => $row['phone'] ?: '—',
-            'address' => $row['address'],
-            'contact' => $row['contact_number'] ?: '—',
-            'rooms' => (int) $row['rooms'],
-            'type' => 'New',
-            'decision' => $decision,
-            'date' => $row['reviewed_at'] ? date('M d, Y', strtotime($row['reviewed_at'])) : 'Not reviewed',
-            'notes' => $row['review_notes'] ?: 'No review notes.',
-        ];
-    }, $rows);
+    return $result ? $result->fetch_all(MYSQLI_ASSOC) : [];
 }
-
-function getAdminConversations(): array
-{
-    return [
-        ['name' => 'Juan Dela Cruz', 'initials' => 'JDC', 'preview' => 'Yes, I already uploaded the sanitary permit.', 'time' => '10:30 AM', 'unread' => 2, 'online' => true],
-        ['name' => 'Pedro Mariposa', 'initials' => 'PM', 'preview' => 'When can we expect the inspection results?', 'time' => 'Yesterday', 'unread' => 0, 'online' => false],
-        ['name' => 'Elena Garcia', 'initials' => 'EG', 'preview' => 'I will submit the missing documents today.', 'time' => 'Jun 12', 'unread' => 1, 'online' => false],
-    ];
-}
-
-?>
-
-#agisivedia
