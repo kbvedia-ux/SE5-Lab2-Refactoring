@@ -86,42 +86,22 @@ function ensureApplicationSchema(): void
         'status' => "ALTER TABLE banlist ADD COLUMN status VARCHAR(30) NOT NULL DEFAULT 'Published' AFTER date_reported",
     ];
 
-    foreach ($userColumns as $column => $sql) {
-        if (!dbColumnExists('users', $column)) {
-            $conn->query($sql);
+    $allColumns = [
+        'users'                  => $userColumns,
+        'boarding_houses'        => $houseColumns,
+        'rooms'                  => $roomColumns,
+        'accreditation_documents' => $documentColumns,
+        'payments'               => $paymentColumns,
+        'banlist'                => $banlistColumns,
+    ];
+
+    foreach ($allColumns as $table => $columns) {
+        foreach ($columns as $column => $sql) {
+            if (!dbColumnExists($table, $column)) {
+                $conn->query($sql);
+            }
         }
     }
-
-    foreach ($houseColumns as $column => $sql) {
-        if (!dbColumnExists('boarding_houses', $column)) {
-            $conn->query($sql);
-        }
-    }
-
-    foreach ($roomColumns as $column => $sql) {
-        if (!dbColumnExists('rooms', $column)) {
-            $conn->query($sql);
-        }
-    }
-
-    foreach ($documentColumns as $column => $sql) {
-        if (!dbColumnExists('accreditation_documents', $column)) {
-            $conn->query($sql);
-        }
-    }
-
-    foreach ($paymentColumns as $column => $sql) {
-        if (!dbColumnExists('payments', $column)) {
-            $conn->query($sql);
-        }
-    }
-
-    foreach ($banlistColumns as $column => $sql) {
-        if (!dbColumnExists('banlist', $column)) {
-            $conn->query($sql);
-        }
-    }
-
     $conn->query(
         "CREATE TABLE IF NOT EXISTS tenants (
             id INT NOT NULL AUTO_INCREMENT,
